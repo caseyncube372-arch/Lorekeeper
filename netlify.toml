@@ -1,0 +1,3 @@
+[build]
+  command = "envsubst < js/app.js > js/app.tmp.js && mv js/app.tmp.js js/app.js"
+  publish = "."
