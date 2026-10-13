@@ -6,12 +6,42 @@
   const LK = (window.LK = window.LK || {});
   const { uid } = LK.util;
 
-  const KEY = 'lorekeeper:v1';
+  const BASE_KEY = 'lorekeeper:v1';
+  let activeKey = BASE_KEY;          // the workspace currently shown/edited
+  let explicitWorkspace = false;     // set once cloud decides whose workspace is active
+
+  /**
+   * Where a workspace lives: the signed-out scratch space persists in
+   * localStorage, but signed-in workspaces are temporary session caches —
+   * the durable copy for signed-in users is the cloud.
+   */
+  function storageFor(key) {
+    return key === BASE_KEY ? localStorage : sessionStorage;
+  }
+
   const ENTRY_TYPES = ['character', 'location', 'kingdom', 'faction'];
   const REL_KINDS = ['ally', 'family', 'rival', 'enemy', 'romance', 'mentor', 'other'];
   const MAX_IMAGE_CHARS = 900000; // ~675 KB binary — keeps worlds inside the 5 MB quota
 
   const now = () => Date.now();
+
+  /** Which localStorage key holds a given account's offline copy? */
+  function workspaceKeyFor(userId) {
+    return userId ? `${BASE_KEY}:u-${userId}` : BASE_KEY;
+  }
+
+  /** Best-effort: which account was last signed in on this device? */
+  function peekSessionUserId() {
+    try {
+      const raw = localStorage.getItem('lorekeeper:auth');
+      if (!raw) return null;
+      const obj = JSON.parse(raw);
+      const s = obj && (obj.currentSession || obj.session || obj);
+      return (s && s.user && s.user.id) || null;
+    } catch (e) {
+      return null;
+    }
+  }
 
   /** Only accept reasonable inline image payloads. */
   function img(value) {
@@ -107,12 +137,15 @@
 
   const store = {
     state: null,
-    KEY,
+    BASE_KEY,
 
     load() {
+      // On first load of the page, follow the account that was last signed in
+      // on this device (the cloud module confirms/switches after it checks).
+      if (!explicitWorkspace) activeKey = workspaceKeyFor(peekSessionUserId());
       let raw = null;
       try {
-        raw = localStorage.getItem(KEY);
+        raw = storageFor(activeKey).getItem(activeKey);
       } catch (e) {
         /* storage unavailable (private mode) — run in-memory */
       }
@@ -126,7 +159,7 @@
 
     save() {
       try {
-        localStorage.setItem(KEY, JSON.stringify(this.state));
+        storageFor(activeKey).setItem(activeKey, JSON.stringify(this.state));
         if (LK.app && LK.app.savedFlash) LK.app.savedFlash();
       } catch (e) {
         if (LK.ui) LK.ui.toast('Browser storage is full — remove some images or export a backup.', 'error');
@@ -314,10 +347,88 @@
       return clean.length;
     },
 
-    /** Rough byte usage of this app's localStorage key. */
+    // ---------- device workspaces ----------
+    /** Key of the workspace currently active on this device. */
+    activeWorkspaceKey() {
+      return activeKey;
+    },
+
+    workspaceKeyFor,
+
+    /**
+     * Point the store at an account's offline workspace (or the shared
+     * guest space when userId is null) and load its contents.
+     */
+    switchWorkspace(userId) {
+      activeKey = workspaceKeyFor(userId);
+      explicitWorkspace = true;
+      return this.load();
+    },
+
+    /** How many worlds sit in the shared, signed-out workspace? */
+    guestWorldCount() {
+      try {
+        const raw = localStorage.getItem(BASE_KEY);
+        if (!raw) return 0;
+        return migrate(JSON.parse(raw)).worlds.length;
+      } catch (e) {
+        return 0;
+      }
+    },
+
+    /** Worlds sitting in the shared, signed-out workspace (id + name only). */
+    guestWorlds() {
+      try {
+        const raw = localStorage.getItem(BASE_KEY);
+        if (!raw) return [];
+        return migrate(JSON.parse(raw)).worlds.map((w) => ({ id: w.id, name: w.name }));
+      } catch (e) {
+        return [];
+      }
+    },
+
+    /**
+     * Move chosen worlds from the shared workspace into the currently
+     * active (signed-in) workspace. Pass an array of ids, or nothing to
+     * move all. Unchosen worlds stay local to the device. Returns how
+     * many were moved.
+     */
+    absorbGuestWorlds(ids) {
+      let guest = null;
+      try {
+        guest = migrate(JSON.parse(localStorage.getItem(BASE_KEY) || 'null'));
+      } catch (e) {
+        guest = null;
+      }
+      if (!guest || !guest.worlds.length) return 0;
+      const wanted = Array.isArray(ids) && ids.length ? new Set(ids) : null;
+      let moved = 0;
+      const keep = [];
+      for (const w of guest.worlds) {
+        const chosen = !wanted || wanted.has(w.id);
+        const exists = this.state.worlds.some((x) => x.id === w.id);
+        if (chosen && !exists) {
+          this.state.worlds.push(w);
+          moved++;
+        }
+        if (!chosen) keep.push(w);
+      }
+      try {
+        localStorage.setItem(BASE_KEY, JSON.stringify({ v: 1, worlds: keep }));
+      } catch (e) { /* ignore */ }
+      if (moved) this.save();
+      return moved;
+    },
+
+    /** Remove a workspace's local cache (the cloud remains the durable copy). */
+    clearWorkspace(key) {
+      try { storageFor(key).removeItem(key); } catch (e) { /* ignore */ }
+    },
+
+    /** Rough byte usage of this app's local cache for the active workspace. */
     usage() {
       try {
-        return (localStorage.getItem(KEY) || '').length * 2;
+        return (storageFor(activeKey).getItem(activeKey) || '').length * 2;
       } catch (e) {
         return 0;
       }

@@ -15,7 +15,6 @@
   const { timeAgo, fmtBytes, esc } = LK.util;
 
   const CONFIG_KEY = 'lorekeeper:cloud';
-  const SYNC_KEY = 'lorekeeper:sync';
   const LIB_URL = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js';
 
   let client = null;        // supabase client (lazy)
@@ -77,16 +76,21 @@
   }
 
   /* ---------- sync snapshot ---------- */
+  /** Each account keeps its own sync bookkeeping on this device. */
+  function syncKey() {
+    return 'lorekeeper:sync:' + (session && session.user ? session.user.id : 'guest');
+  }
+
   function loadSnapshot() {
     try {
-      return JSON.parse(localStorage.getItem(SYNC_KEY) || '{}') || {};
+      return JSON.parse(localStorage.getItem(syncKey()) || '{}') || {};
     } catch (e) {
       return {};
     }
   }
 
   function persistSnapshot() {
-    try { localStorage.setItem(SYNC_KEY, JSON.stringify(snapshot)); } catch (e) { /* ignore */ }
+    try { localStorage.setItem(syncKey(), JSON.stringify(snapshot)); } catch (e) { /* ignore */ }
   }
 
   /* ---------- status pill ---------- */
@@ -196,7 +200,7 @@
       return 'The database refused access ("permission denied"). Fix: open Supabase → SQL Editor, re-run the updated supabase-schema.sql (it now grants the app permission to its tables), then press Sync again.';
     }
     if (/failed to fetch|networkerror|load failed/i.test(msg)) {
-      return 'Could not reach the cloud — check your connection, and that the Project URL in the account menu matches Supabase → Settings → API.';
+      return 'Could not reach the database. Since sign-in worked, your connection is fine — this is usually an ad blocker, privacy extension, antivirus or network filter blocking "supabase.co". Disable shields for this site (or try another browser) and press Sync again.';
     }
     if (/invalid api key|invalid api key|jwt/i.test(msg)) {
       return 'Supabase rejected the API key — copy the anon/publishable key again (Settings → API) and reconnect from the account menu.';
@@ -220,7 +224,7 @@
       return "Supabase rejected the API key — re-copy the anon/publishable key (Project Settings → API) and reconnect from the account menu.";
     }
     if (/failed to fetch|networkerror|load failed/i.test(msg)) {
-      return "Could not reach Supabase — check the Project URL in the account menu matches Settings → API, and that your connection is up.";
+      return "Could not reach Supabase — if the site loads fine, an ad blocker, privacy extension or network filter is likely blocking 'supabase.co'. Disable shields for this site and retry.";
     }
     if (/not enabled|disabled|unsupported_provider/i.test(msg)) {
       return "Email sign-in is switched off for this project — enable the Email provider under Supabase → Authentication → Providers.";
@@ -279,6 +283,14 @@
       setStatus(failed ? 'offline' : 'synced');
       warnedUploadFail = false;
 
+      // Cloud downloads can arrive after the first paint (fresh session
+      // cache) — refresh the view once they land, unless the user is mid-typing.
+      if ((added || updated || plan.removeLocal.length) && LK.app && !LK.ui.hasModal()) {
+        const el = document.activeElement;
+        const typing = el && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName);
+        if (!typing) LK.app.rerender();
+      }
+
       const counts = { uploaded, downloaded: added + updated, removed: plan.removeLocal.length + plan.removeCloud.length, failed };
       if (!silent) {
         if (failed) toast(`Sync finished with ${failed} upload failure(s) — check your connection.`, 'error');
@@ -306,16 +318,17 @@
     if (!dirty.length) return;
     setStatus('syncing');
     let failed = 0;
+    let firstError = null;
     for (const w of dirty) {
       const err = await uploadWorld(w);
-      if (err) failed++;
+      if (err) { failed++; if (!firstError) firstError = err; }
       else snapshot[w.id] = w.updatedAt || Date.now();
     }
     persistSnapshot();
     setStatus(failed ? 'offline' : 'synced');
     if (failed && !warnedUploadFail) {
       warnedUploadFail = true;
-      toast('Could not reach the cloud — your edits are safe on this device and will retry.', 'error');
+      toast('Cloud upload failed. ' + friendlySyncError(firstError), 'error');
     }
   }
 
@@ -335,6 +348,52 @@
     }
   }
 
+  /* ---------- device workspaces ----------
+     Each signed-in account gets its own offline workspace on this
+     device, separate from the shared signed-out space — so signing
+     in never silently mixes one person's drafts into another's account. */
+  function activateWorkspace(userId) {
+    clearTimeout(dirtyTimer);
+    LK.store.save(); // flush whatever workspace is active
+    const previous = LK.store.activeWorkspaceKey();
+    LK.store.switchWorkspace(userId);
+    // Signed-in caches are temporary — wipe one as soon as we leave it,
+    // so a shared browser never keeps anyone's worlds lying around.
+    if (previous !== LK.store.BASE_KEY) LK.store.clearWorkspace(previous);
+    snapshot = loadSnapshot();
+    if (LK.app) LK.app.rerender();
+  }
+
+  /** Offer to fold pre-sign-in local worlds into the freshly signed-in account — selectively. */
+  function offerGuestImport(email) {
+    const list = LK.store.guestWorlds();
+    if (!list.length) return;
+    openModal({
+      title: 'Bring your local worlds?',
+      body: `
+        <p class="muted">This device holds worlds created before signing in as <strong>${esc(email)}</strong>. Tick only the ones that belong in your account — anything unticked stays local to this device and out of the cloud.</p>
+        <div class="links-picker">
+          ${list.map((w) => `
+            <label class="pick">
+              <input type="checkbox" name="gworld" value="${w.id}" checked>
+              <span>${esc(w.name)}</span>
+            </label>`).join('')}
+        </div>`,
+      footer: `
+        <button type="button" class="btn ghost" data-x="leave">Leave all local</button>
+        <button type="button" class="btn primary" data-x="bring">${icon('check', 15)} Bring selected into my account</button>`,
+      onMount(overlay, close) {
+        overlay.querySelector('[data-x="leave"]').addEventListener('click', () => close());
+        overlay.querySelector('[data-x="bring"]').addEventListener('click', () => {
+          const ids = [...overlay.querySelectorAll('[name="gworld"]:checked')].map((c) => c.value);
+          const moved = LK.store.absorbGuestWorlds(ids);
+          close();
+          toast(moved ? `Brought ${moved} world${moved === 1 ? '' : 's'} into your account — uploading…` : 'Nothing selected — worlds left on this device.');
+        });
+      },
+    });
+  }
+
   /* ============================================================
      Auth bootstrap
      ============================================================ */
@@ -345,23 +404,28 @@
       const c = await ensureClient();
       const { data } = await c.auth.getSession();
       session = data.session || null;
+      if (session) activateWorkspace(session.user.id);
       if (session) await syncAll(true);
 
       c.auth.onAuthStateChange((event, s) => {
         session = s;
-        if (event === 'SIGNED_IN') {
-          toast(`Signed in as ${session.user.email} — syncing your worlds…`);
+        if (event === 'SIGNED_IN' && s) {
+          activateWorkspace(s.user.id);
+          toast(`Signed in as ${s.user.email} — syncing your worlds…`);
           setStatus('syncing');
           syncAll(true).then((res) => {
             if (res && !res.error) {
               const n = res.uploaded + res.downloaded;
               toast(n ? `Cloud ready — ${n} world${n === 1 ? '' : 's'} in sync.` : 'Cloud ready — everything in sync.');
             }
+            const guests = LK.store.guestWorldCount();
+            if (guests) offerGuestImport(s.user.email);
           });
         }
         if (event === 'SIGNED_OUT') {
+          activateWorkspace(null);
           setStatus('signed-out');
-          toast('Signed out — your worlds stay on this device.');
+          toast('Signed out — your worlds are safe in your account and hidden on this device.');
         }
         paintPills();
       });
@@ -391,24 +455,52 @@
     clearConfig();
     client = null;
     session = null;
+    // Fold the signed-in workspace back into the shared offline space
+    // so nothing disappears when cloud is switched off.
+    const active = LK.store.activeWorkspaceKey();
+    if (active !== LK.store.BASE_KEY) {
+      const current = LK.store.state;
+      LK.store.switchWorkspace(null);
+      for (const w of current.worlds) {
+        if (!LK.store.state.worlds.some((x) => x.id === w.id)) LK.store.state.worlds.push(w);
+      }
+      LK.store.save();
+    }
+    snapshot = loadSnapshot();
     setStatus('off');
     toast('Cloud disconnected — your worlds remain on this device.');
+    if (LK.app) LK.app.rerender();
   }
 
   /* ============================================================
      Account modal
      ============================================================ */
-  function bodyHTML() {
+  function bodyHTML(ownerForm) {
     const cfg = readConfig();
+    if (!cfg && !ownerForm) {
+      // Visitor view — never push site-owner setup at people.
+      return `
+        <div class="rel-row">
+          <span class="avatar avatar-fallback">${icon('book', 16)}</span>
+          <strong class="min-w-0">Your worlds are saved in this browser</strong>
+          <span class="chip">Local</span>
+        </div>
+        <p class="muted mt-s">Everything you create works offline and stays on this device. If this site's owner enables cloud accounts, you'll be able to sign in with an email link and keep your worlds across devices.</p>
+        <div class="row gap-s mt-m wrap">
+          <button type="button" class="btn ghost sm" data-x="owner">${icon('edit', 14)} Site owner? Set up cloud sync</button>
+        </div>
+        <p class="muted xsmall mt-s">Local storage in use on this device: ~${fmtBytes(LK.store.usage())}.</p>`;
+    }
     if (!cfg) {
       return `
-        <p class="muted">Cloud sync keeps your worlds safe online, syncs them across devices, and lifts the browser's ~5 MB storage limit. It needs a free <a href="https://supabase.com" target="_blank" rel="noopener">Supabase</a> project — about three minutes to set up (see <code>README.md</code> and <code>supabase-schema.sql</code>).</p>
+        <p class="muted"><strong>Owner setup</strong> — cloud sync keeps your visitors' worlds safe online, syncs them across devices, and lifts the browser's ~5 MB storage limit. It needs a free <a href="https://supabase.com" target="_blank" rel="noopener">Supabase</a> project (see <code>README.md</code> and <code>supabase-schema.sql</code>).</p>
         <div class="form-grid">
           ${field('Project URL', `<input class="input" name="sb-url" placeholder="https://xxxxxxxx.supabase.co">`)}
           ${field('Anon public key', `<input class="input" name="sb-key" placeholder="eyJhbGciOiJIUzI1NiIs…">`)}
         </div>
         <div class="row gap-s mt-m">
           <button type="button" class="btn primary" data-x="connect">${icon('link', 15)} Connect</button>
+          <button type="button" class="btn ghost" data-x="back-visitor">Back</button>
         </div>
         <p class="muted xsmall mt-s">These values are stored only in this browser. The anon key is designed to be public — Row Level Security keeps every user's worlds private.</p>
         <p class="muted xsmall">This browser currently holds ~${fmtBytes(LK.store.usage())} of lore against the ~5 MB local limit.</p>`;
@@ -431,8 +523,8 @@
         <strong class="min-w-0">${esc(session.user.email || 'Signed in')}</strong>
         <span class="chip chip-accent">${status === 'syncing' ? 'Syncing…' : status === 'offline' ? 'Offline' : 'Synced'}</span>
       </div>
-      <p class="muted small mt-s">Your worlds live both on this device and in the cloud. Changes sync automatically; if the same world is edited in two places, the most recent edit wins.</p>
-      <p class="muted small">Local cache: ~${fmtBytes(LK.store.usage())} · Last sync: ${lastSyncedAt ? timeAgo(lastSyncedAt) : 'never'}</p>
+      <p class="muted small mt-s">Your worlds live in the cloud — this device only keeps a temporary cache that clears when you close the browser or sign out. Changes sync automatically; if the same world is edited in two places, the most recent edit wins.</p>
+      <p class="muted small">Temporary cache: ~${fmtBytes(LK.store.usage())} · Last sync: ${lastSyncedAt ? timeAgo(lastSyncedAt) : 'never'}</p>
       <div class="row gap-s mt-m wrap">
         <button type="button" class="btn primary" data-x="sync">${icon('check', 15)} Sync now</button>
         <button type="button" class="btn ghost" data-x="signout">Sign out</button>
@@ -440,21 +532,37 @@
   }
 
   function openAccount() {
+    const state = { ownerForm: false };
     openModal({
       title: 'Account & cloud sync',
       body: '<div class="account-body"></div>',
       onMount(overlay, close) {
         const host = overlay.querySelector('.account-body');
         const repaint = () => {
-          host.innerHTML = bodyHTML();
-          wire(host, repaint, close);
+          host.innerHTML = bodyHTML(state.ownerForm);
+          wire(host, repaint, close, state);
         };
         repaint();
       },
     });
   }
 
-  function wire(host, repaint, close) {
+  function wire(host, repaint, close, state) {
+    const ownerBtn = host.querySelector('[data-x="owner"]');
+    if (ownerBtn) {
+      ownerBtn.addEventListener('click', () => {
+        state.ownerForm = true;
+        repaint();
+      });
+    }
+    const backVisitorBtn = host.querySelector('[data-x="back-visitor"]');
+    if (backVisitorBtn) {
+      backVisitorBtn.addEventListener('click', () => {
+        state.ownerForm = false;
+        repaint();
+      });
+    }
+
     const connectBtn = host.querySelector('[data-x="connect"]');
     if (connectBtn) {
       connectBtn.addEventListener('click', () => {
@@ -527,7 +635,7 @@
 
   LK.cloud = {
     init, syncNow, signOut, disconnect, openAccount,
-    paintPills, describe, mergePlan,
+    paintPills, describe, mergePlan, offerGuestImport,
     get status() { return status; },
     get session() { return session; },
   };
