@@ -856,7 +856,7 @@
           </div>
 
           <h3 class="mt-m">Data</h3>
-          <p class="muted small">Local storage used: ~${LK.util.fmtBytes(LK.store.usage())} of ~5 MB browser limit.</p>
+          <p class="muted small">${LK.cloud && LK.cloud.session ? 'Temporary cache used' : 'Local storage used'}: ~${LK.util.fmtBytes(LK.store.usage())}${LK.cloud && LK.cloud.session ? ' — the cloud is your durable storage; this cache clears when the browser closes.' : ' of ~5 MB browser limit.'}</p>
           <div class="meter ${pct > 85 ? 'meter-danger' : pct > 65 ? 'meter-warn' : ''} mt-s"><span style="width:${pct}%"></span></div>
           ${pct > 65 ? `<p class="muted xsmall mt-s">Running low — connect cloud sync from the account menu (top bar), export a backup, or use fewer images.</p>` : ''}
           <p class="muted small mt-m">Cloud backup: ${esc(LK.cloud ? LK.cloud.describe() : 'not connected')}</p>

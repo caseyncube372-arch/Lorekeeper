@@ -11,6 +11,6 @@
    Leaving these empty is fine: the app runs entirely offline.
    ============================================================ */
 window.LOREKEEPER_CLOUD = {
- url: 'https://doglaeijpqmfhykddhmw.supabase.co',
+  url: 'https://doglaeijpqmfhykddhmw.supabase.co',
   anonKey: 'sb_publishable_I1jNxeHwf5NRm2qGRZFG9Q_7rsvcTlp',
 };
